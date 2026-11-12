@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: roblox-audio-backend
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    envVars:
+      - key: MAX_SECONDS
+        value: "420"
+      - key: CACHE_DIR
+        value: "/tmp/audio_cache"
