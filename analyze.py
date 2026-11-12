@@ -1,44 +1,48 @@
 """
-Offline sinusoidal + noise-band analysis.
+Offline sinusoidal + noise-band analysis (memory-lean, single-pass).
 
-Turns a mono 44.1kHz float array into the binary stream described in
-STREAM_FORMAT.md. This is the expensive step; the web layer caches its output
-per source URL so it only runs once per track.
+Produces the binary stream in STREAM_FORMAT.md. Designed to stay well under a
+512 MB free-tier limit even for multi-minute tracks: the audio is float32, and
+frames are quantized and written out as we go rather than all held in memory.
 """
 import numpy as np
 import struct
 
 SR          = 44100
-FRAME_RATE  = 100            # frames per second in the stream
-WINDOW      = 4096           # analysis FFT size (sweet spot; bigger smears time)
-OSC_COUNT   = 224            # partials per frame
-TOL_FRAC    = 0.012          # peak-to-oscillator tracking tolerance
-PEAK_FLOOR  = -90            # dB below frame max to still count a peak
+FRAME_RATE  = 100
+WINDOW      = 4096
+OSC_COUNT   = 224
+TOL_FRAC    = 0.012
+PEAK_FLOOR  = -90
 NOISE_EDGES = [0, 250, 500, 1000, 2000, 4000, 8000, 16000, SR // 2]
 
 MAGIC   = 0x52535631
 VERSION = 1
 
+# Fixed amplitude reference. Input is peak-normalized to 1.0, so a single
+# full-scale sinusoid has amp ~1.0 after /winScale. We headroom x4 so quantizing
+# to u16 never clips, and carry the real loudness in ampScale. One pass, no need
+# to scan all frames for a global max.
+AMP_REF = 4.0
 
-def _seg(x, start, n):
-    out = np.zeros(n, dtype=np.float64)
+
+def _seg_into(dst, x, start, n):
+    dst[:] = 0.0
     a, b = max(start, 0), min(start + n, len(x))
     if b > a:
-        out[a - start:b - start] = x[a:b]
-    return out
+        dst[a - start:b - start] = x[a:b]
 
 
 def analyze(x):
-    """x: mono float array at SR. Returns bytes in stream format v1."""
-    x = np.asarray(x, dtype=np.float64)
-    peak = np.max(np.abs(x)) if len(x) else 1.0
+    x = np.asarray(x, dtype=np.float32)
+    peak = float(np.max(np.abs(x))) if len(x) else 1.0
     if peak > 0:
-        x = x / peak  # normalize; ampScale carries loudness back
+        x = x / peak
 
     hop = SR // FRAME_RATE
     N = WINDOW
-    w = np.hanning(N)
-    ws = w.sum() / 2
+    w = np.hanning(N).astype(np.float32)
+    ws = float(w.sum()) / 2
     nfr = max(len(x) // hop, 1)
     nb = len(NOISE_EDGES) - 1
 
@@ -47,25 +51,29 @@ def analyze(x):
                  for b in range(nb)]
 
     K = OSC_COUNT
-    slot_freq = np.zeros(K)     # freq each slot held last frame
-    slot_live = np.zeros(K, bool)
+    slot_freq = np.zeros(K, dtype=np.float64)
+    slot_live = np.zeros(K, dtype=bool)
 
-    # output arrays
-    out_freq = np.zeros((nfr, K), dtype=np.uint16)
-    out_amp  = np.zeros((nfr, K), dtype=np.uint16)
-    out_noise = np.zeros((nfr, nb), dtype=np.uint16)
+    # header first
+    final_amp_scale = AMP_REF * peak
+    out = bytearray()
+    out += struct.pack("<IHHHHIffII",
+                       MAGIC, VERSION, FRAME_RATE, int(K), int(nb),
+                       int(nfr), float(len(x) / SR), float(final_amp_scale), 0, 0)
+    out += np.array(NOISE_EDGES, dtype="<f4").tobytes()
 
-    global_max_amp = 1e-9
+    seg = np.zeros(N, dtype=np.float32)
+    inter = np.zeros(K * 2, dtype="<u2")
 
-    frames_peaks = []
-    # ---- pass 1: peak pick + track into stable slots ----
     for k in range(nfr):
         c = k * hop + hop // 2
-        X = np.fft.rfft(w * _seg(x, c - N // 2, N))
+        _seg_into(seg, x, c - N // 2, N)
+        X = np.fft.rfft(seg * w)
         mag = np.abs(X) + 1e-12
         db = 20 * np.log10(mag)
         i = np.arange(1, len(db) - 1)
-        pk = i[(db[i] > db[i - 1]) & (db[i] >= db[i + 1]) & (db[i] > db.max() + PEAK_FLOOR)]
+        sel = (db[i] > db[i - 1]) & (db[i] >= db[i + 1]) & (db[i] > db.max() + PEAK_FLOOR)
+        pk = i[sel]
         if len(pk):
             a_, b_, cc = db[pk - 1], db[pk], db[pk + 1]
             denom = (a_ - 2 * b_ + cc)
@@ -77,7 +85,6 @@ def analyze(x):
         else:
             f, amp = np.zeros(0), np.zeros(0)
 
-        # track each peak to nearest live slot, else a free slot
         nf = np.zeros(K); na = np.zeros(K); used = np.zeros(K, bool)
         for ff, aa in zip(f, amp):
             tol = max(6.0, TOL_FRAC * ff)
@@ -95,63 +102,41 @@ def analyze(x):
                     j = rem[0]
             used[j] = True; nf[j] = ff; na[j] = aa
 
-        # slots that kept no peak this frame: keep freq, go silent
         nf[~used] = slot_freq[~used]
         slot_freq = nf.copy()
         slot_live = used.copy()
 
-        if na.max(initial=0) > global_max_amp:
-            global_max_amp = na.max()
-
-        # noise residual: remove sinusoid lobes, measure per-band energy
+        # noise residual per band
         m = mag.copy()
         for ff in nf[used]:
             ci = int(round(ff / SR * N))
             m[max(ci - 3, 0):ci + 4] = 0
-        noise = np.array([np.sqrt(np.sum(m[band_bins[b]] ** 2)) / ws for b in range(nb)])
-        if noise.max(initial=0) > global_max_amp:
-            global_max_amp = noise.max()
+        noise = np.empty(nb, dtype=np.float64)
+        for b in range(nb):
+            noise[b] = np.sqrt(np.sum(m[band_bins[b]] ** 2)) / ws
 
-        frames_peaks.append((nf, na, noise))
-
-    # ---- pass 2: quantize with a single amp scale ----
-    amp_scale = global_max_amp if global_max_amp > 0 else 1.0
-    for k, (nf, na, noise) in enumerate(frames_peaks):
-        fq = np.clip(np.round(nf / 0.5), 0, 65535).astype(np.uint16)
+        # quantize this frame and append
+        fq = np.clip(np.round(nf / 0.5), 0, 65535).astype("<u2")
         fq[na <= 0] = 0
-        aq = np.clip(np.round(na / amp_scale * 65535), 0, 65535).astype(np.uint16)
-        nq = np.clip(np.round(noise / amp_scale * 65535), 0, 65535).astype(np.uint16)
-        out_freq[k] = fq
-        out_amp[k] = aq
-        out_noise[k] = nq
+        aq = np.clip(np.round(na / AMP_REF * 65535), 0, 65535).astype("<u2")
+        inter[0::2] = fq
+        inter[1::2] = aq
+        out += inter.tobytes()
+        nq = np.clip(np.round(noise / AMP_REF * 65535), 0, 65535).astype("<u2")
+        out += nq.tobytes()
 
-    # amp decoded as raw/65535*ampScale; carry original loudness (peak) too
-    final_amp_scale = amp_scale * peak
-
-    # ---- serialize ----
-    buf = bytearray()
-    # header: magic(I) ver(H) frameRate(H) osc(H) bands(H) frameCount(I)
-    #         duration(f) ampScale(f) reserved(I) reserved(I) = 32 bytes
-    buf += struct.pack("<IHHHHIffII",
-                       MAGIC, VERSION, FRAME_RATE, int(K), int(nb),
-                       int(nfr), float(len(x) / SR), float(final_amp_scale), 0, 0)
-    buf += np.array(NOISE_EDGES, dtype="<f4").tobytes()
-    for k in range(nfr):
-        inter = np.empty(K * 2, dtype="<u2")
-        inter[0::2] = out_freq[k]
-        inter[1::2] = out_amp[k]
-        buf += inter.tobytes()
-        buf += out_noise[k].astype("<u2").tobytes()
-    return bytes(buf)
+    return bytes(out)
 
 
 if __name__ == "__main__":
-    # self-test with a synthetic tone sweep
+    import resource, time
     t = np.arange(SR * 3) / SR
     x = 0.5 * np.sin(2 * np.pi * (220 + 220 * t) * t) + 0.1 * np.random.randn(len(t))
+    t0 = time.time()
     blob = analyze(x)
-    print(f"stream: {len(blob)} bytes for {len(x)/SR:.1f}s")
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    print(f"stream {len(blob)} bytes, {time.time()-t0:.1f}s, peak RSS {rss:.0f}MB")
     magic, ver, fr, osc, nb, nfr, dur, amps, _, _ = struct.unpack_from("<IHHHHIffII", blob, 0)
-    print(f"magic=0x{magic:X} ver={ver} frameRate={fr} osc={osc} bands={nb} frames={nfr} dur={dur:.2f}s ampScale={amps:.4f}")
-    assert magic == MAGIC and ver == VERSION
+    print(f"magic=0x{magic:X} osc={osc} bands={nb} frames={nfr} dur={dur:.2f} ampScale={amps:.4f}")
+    assert magic == MAGIC
     print("OK")
